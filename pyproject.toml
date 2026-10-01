@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "selas"
+version = "0.1.0"
+description = "Tiered-memory inference engine for diffusion transformers (FLUX) — run models larger than your VRAM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Taylor Cox", email = "taylor@taylor-cox.dev" }]
+keywords = ["flux", "diffusion", "inference", "offloading", "vram", "pytorch", "cuda"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Graphics",
+]
+dependencies = [
+    "torch>=2.4",
+    "safetensors>=0.4.3",
+    "numpy>=1.24",
+    "pillow>=10",
+    "transformers>=4.44",   # tokenizers only (CLIP BPE + T5)
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "diffusers>=0.32",      # oracle for FLUX transformer + VAE
+]
+dev = [
+    "selas[test]",
+    "pyflakes>=3",
+]
+
+[project.scripts]
+selas = "selas.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["selas*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cuda: needs a CUDA device",
+    "oracle: compares against diffusers/transformers reference implementations",
+    "realmodel: needs a converted real model (SELAS_TEST_MODEL)",
+    "slow: long-running",
+]
