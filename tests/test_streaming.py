@@ -5,12 +5,14 @@ Also exercises the step cache and block-major micro-batching through the real st
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import torch
 
 from selas.convert import ConvertOptions, convert_t5, t5_view
 from selas.container import Container
-from selas.models.flux import FluxRunner, main_order, mod_order
+from selas.models.flux import EAGER, FluxRunner, Kernels, compile_available, main_order, mod_order
 from selas.models.t5 import T5Config, T5Encoder
 from selas.sampling import get_schedule
 from selas.sources import TensorSource
@@ -23,7 +25,8 @@ pytestmark = [needs_cuda, pytest.mark.cuda]
 DEV = torch.device("cuda", 0) if torch.cuda.is_available() else None
 
 
-def _run(c, tiers, dtype=torch.float16, steps=3, arena=None, staging=0, cache_cfg=None, micro=None, batch=2, host_res=False):
+def _run(c, tiers, dtype=torch.float16, steps=3, arena=None, staging=0, cache_cfg=None, micro=None, batch=2, host_res=False,
+         kernels=EAGER, order=None, on_store=None):
     cfg = TINY_FLUX
     x, txt, pooled, img_ids, txt_ids = tiny_inputs(cfg, batch=batch)
     x = x.to(DEV)
@@ -31,8 +34,10 @@ def _run(c, tiers, dtype=torch.float16, steps=3, arena=None, staging=0, cache_cf
     if arena is None:
         arena = 3 * max(c.units[n].nbytes for n in names)
     sigmas = get_schedule(steps, x.shape[1])
-    with WeightStore(c, tiers, DEV, dtype, arena_bytes=arena, staging_bytes=staging) as st:
-        runner = FluxRunner(st, cfg, dtype, micro_batch=micro)
+    with WeightStore(c, tiers, DEV, dtype, arena_bytes=arena, staging_bytes=staging, order=order) as st:
+        if on_store:
+            on_store(st)
+        runner = FluxRunner(st, cfg, dtype, micro_batch=micro, kernels=kernels)
         cond = runner.prepare(sigmas, 3.5, pooled, txt, img_ids, txt_ids)
         streamed = {n for n in runner.main if runner.is_streamed(n)}
         cache = StepCache(cache_cfg, steps, streamed, torch.bfloat16, host_residuals=host_res) if cache_cfg else None
@@ -77,6 +82,17 @@ def test_placement_is_bit_exact(tiny_container, mode):
     assert stats.units_streamed > 0
 
 
+
+@pytest.mark.skipif(not compile_available(DEV or "cpu"), reason="torch.compile needs Triton")
+def test_fused_kernels_match_eager_and_stay_placement_exact(tiny_container):
+    fused = Kernels(compiled=True)
+    eager, _, _ = _run(tiny_container, _tiers(tiny_container, VRAM))
+    ref, _, _ = _run(tiny_container, _tiers(tiny_container, VRAM), kernels=fused)
+    out, _, _ = _run(tiny_container, _tiers(tiny_container, "mixed"), kernels=fused)
+    assert torch.equal(out, ref)  # placement still never changes numerics
+    rel = ((ref - eager).norm() / eager.norm()).item()
+    assert 0 < rel < 2e-3, rel  # same math, different rounding
+
 def test_minimal_arena_and_staging_are_bit_exact(tiny_container):
     c = tiny_container
     names = main_order(TINY_FLUX) + mod_order(TINY_FLUX)
@@ -92,6 +108,65 @@ def test_cyclic_prefetch_crosses_step_boundaries(tiny_container):
     n_main = len(main_order(TINY_FLUX))
     # every step streams every main unit once; prefetch may run at most an arena's worth ahead
     assert stats.units_streamed >= 4 * n_main
+
+
+def _slow_reads(monkeypatch, c, delay=0.01, fail=None):
+    """Make every unit read take ``delay`` s (so compute overlaps loading); returns the read order."""
+    reads, orig = [], c.read_unit_into
+
+    def read(spec, dst, direct=False):
+        time.sleep(delay)
+        if spec.name == fail:
+            raise OSError("injected read error")
+        reads.append(spec.name)
+        return orig(spec, dst, direct=direct)
+
+    monkeypatch.setattr(c, "read_unit_into", read)
+    return reads
+
+
+def test_compute_overlaps_loading_and_stays_exact(tiny_container, monkeypatch):
+    c = tiny_container
+    ref, _, _ = _run(c, _tiers(c, VRAM))
+    _slow_reads(monkeypatch, c)
+    seen = {}
+    order = ["globals"] + mod_order(TINY_FLUX) + main_order(TINY_FLUX)
+    out, _, _ = _run(c, _tiers(c, "mixed"), order=order,
+                     on_store=lambda st: seen.update(loading=not all(st.is_ready(n) for n in st.order)))
+    assert seen["loading"]  # the store returned before its units were read
+    assert torch.equal(out, ref)
+
+
+def test_units_load_in_first_use_order(tiny_container, monkeypatch):
+    c = tiny_container
+    reads = _slow_reads(monkeypatch, c, delay=0)
+    order = ["globals"] + mod_order(TINY_FLUX) + main_order(TINY_FLUX)[::-1]
+    tiers = _tiers(c, HOST) | {n: VRAM for n in main_order(TINY_FLUX)[::2]}
+    with WeightStore(c, tiers, DEV, torch.float16, arena_bytes=c.units["double.0"].nbytes, order=order) as st:
+        st.wait_loaded()
+        assert all(st.is_ready(n) for n in c.units)
+    assert reads[: len(order)] == order
+    assert sorted(reads) == sorted(c.units)
+
+
+def test_close_while_loading_stops_the_loader(tiny_container, monkeypatch):
+    c = tiny_container
+    reads = _slow_reads(monkeypatch, c, delay=0.05)
+    st = WeightStore(c, _tiers(c, HOST), DEV, torch.float16, arena_bytes=c.units["double.0"].nbytes)
+    st.close()  # finishes the read in flight, then stops
+    assert len(reads) < len(c.units) // 2
+    assert st.pool is None and not st.views
+    monkeypatch.undo()
+    out, _, _ = _run(c, _tiers(c, HOST))  # nothing left behind
+    assert torch.isfinite(out).all()
+
+
+def test_loader_error_reaches_the_consumer(tiny_container, monkeypatch):
+    c = tiny_container
+    _slow_reads(monkeypatch, c, delay=0, fail="single.0")
+    for mode in (HOST, VRAM):
+        with pytest.raises(RuntimeError, match="loading weights failed.*injected read error"):
+            _run(c, _tiers(c, mode))
 
 
 def test_stream_order_violation_is_detected(tiny_container):

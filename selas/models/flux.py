@@ -18,6 +18,11 @@ Runner-level optimizations, all exact:
 * ``txt_in``, RoPE tables and time/guidance embeddings computed once;
 * block-major micro-batching: several images pass through a block while it is
   loaded, ``micro_batch`` at a time.
+
+Kernel fusion (``Kernels(compiled=True)``, the default on CUDA) runs the
+elementwise code between matmuls as ``torch.compile``-generated kernels: the same
+fp32 math, not bitwise equal to eager. Placements stay bit-identical to each
+other within either mode.
 """
 
 from __future__ import annotations
@@ -142,18 +147,157 @@ def _ln(x: torch.Tensor) -> torch.Tensor:
     return F.layer_norm(x, (x.shape[-1],), eps=1e-6)
 
 
-def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+def mlp_embed(w: UnitView, prefix: str, x: torch.Tensor) -> torch.Tensor:
+    return w.linear(F.silu(w.linear(x, prefix + ".in_layer")), prefix + ".out_layer")
+
+
+# --------------------------------------------------------------------------- kernels
+#
+# Everything between the matmuls and the attention is elementwise or a small
+# per-row reduction, and memory-bound: in eager PyTorch it was ~25 % of a 1024²
+# step on an RTX 2080 Ti. The blocks are therefore written as matmuls/attention
+# plus a few elementwise *segments*; ``Kernels`` holds the segments, either as the
+# plain eager functions below or fused by ``torch.compile`` (one Triton kernel per
+# segment, same fp32 math, results differ from eager only by rounding).
+
+
+def _mod_in(x, shift, scale, dt):
+    """LayerNorm + modulation, cast for the next matmul."""
     return (_ln(x) * (1 + scale) + shift).to(dt)
 
 
-def mlp_embed(w: UnitView, prefix: str, x: torch.Tensor) -> torch.Tensor:
-    return w.linear(F.silu(w.linear(x, prefix + ".in_layer")), prefix + ".out_layer")
+def _gated_add(x, g, y, guard: bool):
+    """Gated residual update."""
+    return x + g * _res(y, guard)
+
+
+def _gated_add_mod(x, g, y, shift, scale, dt, guard: bool):
+    x = _gated_add(x, g, y, guard)
+    return x, _mod_in(x, shift, scale, dt)
+
+
+def _qkv_double(tqkv, iqkv, tqs, tks, iqs, iks, cos, sin, heads: int, dt):
+    """Split heads, QK-RMSNorm per stream, join txt+img, RoPE: (q, k, v) for attention."""
+    tq, tk, tv = _heads(tqkv, heads)
+    iq, ik, iv = _heads(iqkv, heads)
+    q = apply_rope(torch.cat((qk_rms(tq, tqs), qk_rms(iq, iqs)), dim=2), cos, sin).to(dt)
+    k = apply_rope(torch.cat((qk_rms(tk, tks), qk_rms(ik, iks)), dim=2), cos, sin).to(dt)
+    return q, k, torch.cat((tv, iv), dim=2)
+
+
+def _qkv_single(qkv, qs, ks, cos, sin, heads: int, dt):
+    q, k, v = _heads(qkv, heads)
+    # v is a strided view into linear1's output; keep SDPA on its memory-efficient kernel
+    return apply_rope(qk_rms(q, qs), cos, sin).to(dt), apply_rope(qk_rms(k, ks), cos, sin).to(dt), v.contiguous()
+
+
+def _gelu(h):
+    return F.gelu(h, approximate="tanh")
+
+
+def _attn_mlp(attn, mlp):
+    """Single block: attention output and activated MLP branch, side by side for linear2."""
+    return torch.cat((attn, _gelu(mlp)), dim=2)
+
+
+SEGMENTS = (_mod_in, _gated_add, _gated_add_mod, _qkv_double, _qkv_single, _gelu, _attn_mlp)
+
+
+class Kernels:
+    """The elementwise segments of a block, eager or compiled."""
+
+    def __init__(self, compiled: bool = False):
+        self.compiled = compiled
+        for fn in SEGMENTS:
+            setattr(self, fn.__name__.lstrip("_"), _compile(fn) if compiled else fn)
+
+
+def _compile(fn):
+    """``torch.compile(fn)``, falling back to ``fn`` for good if compilation fails."""
+    from ..util import warn
+
+    state = {"fn": torch.compile(fn, dynamic=False, fullgraph=True)}
+
+    def call(*args):
+        try:
+            return state["fn"](*args)
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:
+            if state["fn"] is fn:
+                raise
+            warn(f"torch.compile failed for {fn.__name__} ({type(e).__name__}: {str(e).splitlines()[0][:200]}); "
+                 "using eager kernels for it")
+            state["fn"] = fn
+            return fn(*args)
+
+    call.__name__ = fn.__name__
+    return call
+
+
+def compile_count() -> int:
+    """Frames torch.compile has compiled in this process so far (0 if the counter is unavailable)."""
+    try:
+        from torch._dynamo.utils import counters
+
+        return int(counters["stats"]["unique_graphs"])
+    except Exception:  # pragma: no cover
+        return 0
+
+
+def compile_available(device: torch.device) -> bool:
+    """torch.compile's GPU backend needs Triton (and a CUDA device)."""
+    if torch.device(device).type != "cuda":
+        return False
+    try:
+        from torch.utils._triton import has_triton
+
+        return has_triton()
+    except Exception:  # pragma: no cover
+        return False
+
+
+EAGER = Kernels()
+
+
+class _ShapeOnly:
+    """Stands in for a :class:`UnitView`: right output shapes, no weights, no matmuls."""
+
+    def __init__(self, shapes: dict[str, tuple[int, ...]], dt: torch.dtype, device: torch.device):
+        self.shapes, self.dt, self.device = shapes, dt, device
+
+    def get(self, name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
+        return torch.zeros(self.shapes[name], dtype=dtype or self.dt, device=self.device)
+
+    def linear(self, x: torch.Tensor, prefix: str, dtype: torch.dtype | None = None) -> torch.Tensor:
+        return torch.zeros(*x.shape[:-1], self.shapes[prefix + ".weight"][0], dtype=x.dtype, device=x.device)
+
+
+@torch.no_grad()
+def warm_kernels(k: Kernels, cfg: FluxConfig, shapes: dict[str, dict[str, tuple]], l_img: int, l_txt: int, batch: int,
+                 dt: torch.dtype, device: torch.device) -> None:
+    """Compile ``k``'s segments for these shapes by running the blocks once on zeros.
+
+    The blocks' own code makes the calls, so arguments match the real run exactly
+    (shapes, dtypes, strides) and the real run hits the compiled code. Meant for a
+    background thread while the weights load: compiling is CPU work, loading is I/O.
+    """
+    guard = dt == torch.float16
+    z = lambda *s, d=torch.float32: torch.zeros(*s, dtype=d, device=device)  # noqa: E731
+    d, lt = cfg.hidden, l_txt
+    img, txt = z(batch, l_img, d), z(batch, lt, d)
+    cos, sin = z(lt + l_img, cfg.head_dim // 2), z(lt + l_img, cfg.head_dim // 2)  # distinct: guards check identity
+    double_block(_ShapeOnly(shapes["double"], dt, device), img, txt, z(batch, 12 * d, d=dt), cos, sin, cfg, dt, guard, k)
+    x = torch.cat((txt, img), 1)
+    single_block(_ShapeOnly(shapes["single"], dt, device), x, z(batch, 3 * d, d=dt), cos, sin, cfg, dt, guard, k)
+    final_layer(_ShapeOnly(shapes["globals"], dt, device), x[:, lt:], z(batch, 2 * d, d=dt), dt, k)
+    torch.cuda.synchronize(device)
 
 
 # --------------------------------------------------------------------------- blocks
 
 
-def double_block(w: UnitView, img, txt, mod, cos, sin, cfg: FluxConfig, dt, guard: bool):
+def double_block(w: UnitView, img, txt, mod, cos, sin, cfg: FluxConfig, dt, guard: bool, k: Kernels = EAGER):
     """img [B, Li, D] fp32, txt [B, Lt, D] fp32, mod [B, 12D] (img 6D | txt 6D)."""
     m = mod.float().unsqueeze(1).chunk(12, dim=-1)
     i_sh1, i_sc1, i_g1, i_sh2, i_sc2, i_g2 = m[:6]
@@ -161,50 +305,42 @@ def double_block(w: UnitView, img, txt, mod, cos, sin, cfg: FluxConfig, dt, guar
     lt = txt.shape[1]
     f32 = torch.float32
 
-    iq, ik, iv = _heads(w.linear(_modulate(img, i_sh1, i_sc1, dt), "img_attn.qkv"), cfg.heads)
-    tq, tk, tv = _heads(w.linear(_modulate(txt, t_sh1, t_sc1, dt), "txt_attn.qkv"), cfg.heads)
-    q = torch.cat((qk_rms(tq, w.get("txt_attn.norm.query_norm.scale", f32)), qk_rms(iq, w.get("img_attn.norm.query_norm.scale", f32))), dim=2)
-    k = torch.cat((qk_rms(tk, w.get("txt_attn.norm.key_norm.scale", f32)), qk_rms(ik, w.get("img_attn.norm.key_norm.scale", f32))), dim=2)
-    del iq, ik, tq, tk
-    q = apply_rope(q, cos, sin).to(dt)
-    k = apply_rope(k, cos, sin).to(dt)
-    v = torch.cat((tv, iv), dim=2)
-    attn = _attention(q, k, v)
-    del q, k, v, iv, tv
+    iqkv = w.linear(k.mod_in(img, i_sh1, i_sc1, dt), "img_attn.qkv")
+    tqkv = w.linear(k.mod_in(txt, t_sh1, t_sc1, dt), "txt_attn.qkv")
+    q, kk, v = k.qkv_double(tqkv, iqkv, w.get("txt_attn.norm.query_norm.scale", f32), w.get("txt_attn.norm.key_norm.scale", f32),
+                            w.get("img_attn.norm.query_norm.scale", f32), w.get("img_attn.norm.key_norm.scale", f32),
+                            cos, sin, cfg.heads, dt)
+    del iqkv, tqkv
+    attn = _attention(q, kk, v)
+    del q, kk, v
     t_attn, i_attn = attn[:, :lt], attn[:, lt:]
 
-    img = img + i_g1 * _res(w.linear(i_attn, "img_attn.proj"), guard)
-    h = w.linear(_modulate(img, i_sh2, i_sc2, dt), "img_mlp.0")
-    h = w.linear(F.gelu(h, approximate="tanh"), "img_mlp.2")
-    img = img + i_g2 * _res(h, guard)
-
-    txt = txt + t_g1 * _res(w.linear(t_attn, "txt_attn.proj"), guard)
-    h = w.linear(_modulate(txt, t_sh2, t_sc2, dt), "txt_mlp.0")
-    h = w.linear(F.gelu(h, approximate="tanh"), "txt_mlp.2")
-    txt = txt + t_g2 * _res(h, guard)
+    img, h = k.gated_add_mod(img, i_g1, w.linear(i_attn, "img_attn.proj"), i_sh2, i_sc2, dt, guard)
+    h = w.linear(h, "img_mlp.0")
+    img = k.gated_add(img, i_g2, w.linear(k.gelu(h), "img_mlp.2"), guard)
+    txt, h = k.gated_add_mod(txt, t_g1, w.linear(t_attn, "txt_attn.proj"), t_sh2, t_sc2, dt, guard)
+    h = w.linear(h, "txt_mlp.0")
+    txt = k.gated_add(txt, t_g2, w.linear(k.gelu(h), "txt_mlp.2"), guard)
     return img, txt
 
 
-def single_block(w: UnitView, x, mod, cos, sin, cfg: FluxConfig, dt, guard: bool):
+def single_block(w: UnitView, x, mod, cos, sin, cfg: FluxConfig, dt, guard: bool, k: Kernels = EAGER):
     """x [B, Lt+Li, D] fp32, mod [B, 3D]."""
     sh, sc, g = mod.float().unsqueeze(1).chunk(3, dim=-1)
     f32 = torch.float32
-    h = w.linear(_modulate(x, sh, sc, dt), "linear1")
+    h = w.linear(k.mod_in(x, sh, sc, dt), "linear1")
     qkv, mlp = h.split([3 * cfg.hidden, cfg.mlp_hidden], dim=-1)
-    q, k, v = _heads(qkv, cfg.heads)
-    q = apply_rope(qk_rms(q, w.get("norm.query_norm.scale", f32)), cos, sin).to(dt)
-    k = apply_rope(qk_rms(k, w.get("norm.key_norm.scale", f32)), cos, sin).to(dt)
-    # v is a strided view into linear1's output; keep SDPA on its memory-efficient kernel
-    attn = _attention(q, k, v.contiguous())
-    del q, k, v, qkv
-    out = w.linear(torch.cat((attn, F.gelu(mlp, approximate="tanh")), dim=2), "linear2")
+    q, kk, v = k.qkv_single(qkv, w.get("norm.query_norm.scale", f32), w.get("norm.key_norm.scale", f32), cos, sin, cfg.heads, dt)
+    attn = _attention(q, kk, v)
+    del q, kk, v, qkv
+    out = w.linear(k.attn_mlp(attn, mlp), "linear2")
     del h, mlp, attn
-    return x + g * _res(out, guard)
+    return k.gated_add(x, g, out, guard)
 
 
-def final_layer(w: UnitView, img, fmod, dt):
+def final_layer(w: UnitView, img, fmod, dt, k: Kernels = EAGER):
     sh, sc = fmod.float().unsqueeze(1).chunk(2, dim=-1)
-    return w.linear(_modulate(img, sh, sc, dt), "final_layer.linear").float()
+    return w.linear(k.mod_in(img, sh, sc, dt), "final_layer.linear").float()
 
 
 # --------------------------------------------------------------------------- cost model
@@ -255,8 +391,10 @@ class StepInfo:
 
 
 class FluxRunner:
-    def __init__(self, store: WeightStore, cfg: FluxConfig, dtype: torch.dtype, micro_batch: int | None = None):
+    def __init__(self, store: WeightStore, cfg: FluxConfig, dtype: torch.dtype, micro_batch: int | None = None,
+                 kernels: Kernels = EAGER):
         self.store = store
+        self.k = kernels
         self.cfg = cfg
         self.dt = dtype
         self.guard = dtype == torch.float16
@@ -270,30 +408,57 @@ class FluxRunner:
 
     # ------------------------------------------------------------------ prologue
     @torch.no_grad()
-    def prepare(self, sigmas, guidance: float, pooled: torch.Tensor, txt: torch.Tensor, img_ids: torch.Tensor, txt_ids: torch.Tensor) -> FluxConditioning:
-        """Everything that does not depend on the latent: done once per image batch."""
+    def svec(self, sigmas, guidance: float, pooled: torch.Tensor) -> torch.Tensor:
+        """silu(vec) [S, 1, D] for one image (``pooled`` [1, 768]): timestep + guidance + CLIP embeddings.
+
+        Resident weights only, so cheap. Computed per image, never batched, so an image's
+        modulation vectors are the same bits whatever batch it is in (see :mod:`selas.modcache`).
+        """
         cfg, g, dt = self.cfg, self.g, self.dt
         dev = self.store.device
-        b = pooled.shape[0]
         t = torch.tensor(list(sigmas[:-1]), dtype=torch.float32, device=dev)  # [S]
         vec = mlp_embed(g, "time_in", timestep_embedding(t, 256).to(dt)).float()[:, None, :]  # [S, 1, D]
         if cfg.guidance_embed:
-            gv = torch.full((b,), float(guidance), dtype=torch.float32, device=dev)
+            gv = torch.full((1,), float(guidance), dtype=torch.float32, device=dev)
             vec = vec + mlp_embed(g, "guidance_in", timestep_embedding(gv, 256).to(dt)).float()[None]
-        vec = vec + mlp_embed(g, "vector_in", pooled.to(dev, dt)).float()[None]  # [S, B, D]
-        svec = F.silu(vec).to(dt)
+        vec = vec + mlp_embed(g, "vector_in", pooled.to(dev, dt)).float()[None]
+        return F.silu(vec).to(dt)
 
-        mods: dict[str, torch.Tensor] = {}
+    @torch.no_grad()
+    def modulations(self, svecs: list[torch.Tensor]) -> list[dict[str, torch.Tensor]]:
+        """Every main unit's modulation vectors [S, 1, kD], for each image's ``svec``.
+
+        The one part of the prologue that needs the modulation units (27 % of the
+        weights): they are streamed once, however many images there are.
+        """
+        outs: list[dict[str, torch.Tensor]] = [{} for _ in svecs]
         with self.store.stream(self.mod_units, cyclic=False) as st:
             for name in self.mod_units:
                 w = st.acquire(name)
-                if name.startswith("double."):
-                    out = torch.cat((w.linear(svec, "img_mod.lin"), w.linear(svec, "txt_mod.lin")), dim=-1)
-                else:
-                    out = w.linear(svec, "modulation.lin")
+                main = name.removesuffix(".mod")
+                for out, sv in zip(outs, svecs):
+                    if name.startswith("double."):
+                        out[main] = torch.cat((w.linear(sv, "img_mod.lin"), w.linear(sv, "txt_mod.lin")), dim=-1)
+                    else:
+                        out[main] = w.linear(sv, "modulation.lin")
                 st.release(name)
-                mods[name.removesuffix(".mod")] = out
-        final_mod = g.linear(svec, "final_layer.adaLN_modulation.1")
+        return outs
+
+    @torch.no_grad()
+    def prepare(self, sigmas, guidance: float, pooled: torch.Tensor, txt: torch.Tensor, img_ids: torch.Tensor,
+                txt_ids: torch.Tensor, mods: dict[str, torch.Tensor] | None = None) -> FluxConditioning:
+        """Everything that does not depend on the latent: done once per image batch.
+
+        ``mods``: the batch's modulation vectors ({main unit: [S, B, kD]}) if already
+        known, e.g. from the cache; otherwise they are computed here.
+        """
+        cfg, g, dt = self.cfg, self.g, self.dt
+        dev = self.store.device
+        svecs = [self.svec(sigmas, guidance, pooled[i : i + 1]) for i in range(pooled.shape[0])]
+        if mods is None:
+            per_image = self.modulations(svecs)
+            mods = {n: torch.cat([m[n] for m in per_image], dim=1) for n in self.main}
+        final_mod = torch.cat([g.linear(sv, "final_layer.adaLN_modulation.1") for sv in svecs], dim=1)
         txt_h = g.linear(txt.to(dev, dt), "txt_in").float()
         ids = torch.cat((txt_ids, img_ids), dim=0).to(dev)
         cos, sin = rope_tables(ids, cfg.axes_dim, cfg.theta)
@@ -334,9 +499,10 @@ class FluxRunner:
         mod = cond.mods[name][s]
         chunks = self._chunks(img.shape[0])
         if len(chunks) == 1:
-            img, txt = double_block(w, img, txt, mod, cond.cos, cond.sin, self.cfg, self.dt, self.guard)
+            img, txt = double_block(w, img, txt, mod, cond.cos, cond.sin, self.cfg, self.dt, self.guard, self.k)
         else:
-            outs = [double_block(w, img[a:e], txt[a:e], mod[a:e], cond.cos, cond.sin, self.cfg, self.dt, self.guard) for a, e in chunks]
+            outs = [double_block(w, img[a:e], txt[a:e], mod[a:e], cond.cos, cond.sin, self.cfg, self.dt, self.guard, self.k)
+                    for a, e in chunks]
             img = torch.cat([o[0] for o in outs])
             txt = torch.cat([o[1] for o in outs])
         self._untimed(tok)
@@ -349,9 +515,10 @@ class FluxRunner:
         mod = cond.mods[name][s]
         chunks = self._chunks(x.shape[0])
         if len(chunks) == 1:
-            x = single_block(w, x, mod, cond.cos, cond.sin, self.cfg, self.dt, self.guard)
+            x = single_block(w, x, mod, cond.cos, cond.sin, self.cfg, self.dt, self.guard, self.k)
         else:
-            x = torch.cat([single_block(w, x[a:e], mod[a:e], cond.cos, cond.sin, self.cfg, self.dt, self.guard) for a, e in chunks])
+            x = torch.cat([single_block(w, x[a:e], mod[a:e], cond.cos, cond.sin, self.cfg, self.dt, self.guard, self.k)
+                           for a, e in chunks])
         self._untimed(tok)
         self._stream.release(name)
         return x
@@ -411,7 +578,7 @@ class FluxRunner:
             del x
             if decision == FULL and cache is not None and cache.active:
                 cache.put_tail(sigma, img - img_probe)
-        out = final_layer(self.g, img, cond.final_mod[s], dt)
+        out = final_layer(self.g, img, cond.final_mod[s], dt, self.k)
         return out, info
 
     def is_streamed(self, name: str) -> bool:

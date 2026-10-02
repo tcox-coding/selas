@@ -38,6 +38,7 @@ def timed_run(eng, cycle_tiers, arena, staging, res, steps, txt, pooled, label) 
     t0 = time.perf_counter()
     with WeightStore(eng.tc, tiers, eng.device, eng.dtype, arena_bytes=arena, staging_bytes=staging,
                      profile=True, label=label) as st:
+        st.wait_loaded()  # the store loads in the background; time the whole load
         load_s = time.perf_counter() - t0
         r = FluxRunner(st, cfg, eng.dtype)
         cond = r.prepare(sig, 3.5, pooled[None], txt[None], image_ids(res, res), text_ids(txt.shape[0]))

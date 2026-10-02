@@ -21,19 +21,23 @@ diffusion is iterative.
 
 FLUX.1-dev, full precision (fp16, 22 GiB transformer), 1024², on an RTX 2080 Ti (11 GB, PCIe 3.0):
 
-| | VRAM used (whole process) | time per step |
-|---|---|---|
-| everything on the GPU (what it would take) | ~23 GiB, ~32 GiB with T5 | — |
-| `selas generate` (default) | 7.9 GiB | 2.64 s |
-| `selas generate --vram-gb 2` | **2.0 GiB** | 2.74 s (+4 %) |
+| | VRAM used (whole process) | time per step | one image, start to finish |
+|---|---|---|---|
+| everything on the GPU (what it would take) | ~23 GiB, ~32 GiB with T5 | — | — |
+| `selas generate` (default) | 8.4 GiB | 2.2–2.3 s | 84 s |
+| `selas generate --vram-gb 2` | **1.9 GiB** | 2.34 s | 89 s |
+| `selas generate --fp16-accum` (approximate) | 8.4 GiB | 1.73 s | 69 s |
+
+Measured with the GPU thermally throttled (84 °C, 1350 MHz), 28 steps, prompt cached. Under the same
+conditions version 0.1.0 took 2.74–2.97 s per step and 101–109 s per image.
 
 * At 1024² the GPU waits on weight transfers for about 0.1 ms per step: streaming is almost free.
-* With only 6 GiB of pinned RAM, the rest is read from NVMe each step: 2.87 s/step.
-* A 4-bit NF4 conversion fits entirely in VRAM (5.3 GiB allocated) and runs at 2.68 s/step.
+* With only 6 GiB of pinned RAM, the rest is read from NVMe each step: 2.87 s/step (0.1.0).
+* A 4-bit NF4 conversion fits entirely in VRAM (5.3 GiB allocated) and runs at 2.68 s/step (0.1.0).
 * At 512² a step is too short to hide transfers, and streaming everything is 63 % slower than the default.
 
 All placements give **bit-identical** images. The tests and the measurements check this. Every
-approximation is opt-in and named in the output. [docs/PLAN.md](docs/PLAN.md) has the design and every
+approximation is opt-in and named in the output (`--fp16-accum`, `--cache`). [docs/PLAN.md](docs/PLAN.md) has the design and every
 measurement, including the hypotheses that did not work out.
 
 ## How it works
@@ -45,17 +49,25 @@ measurement, including the hypotheses that did not work out.
 2. **Prefetch never stops.** The schedule is known before step 1, so copies run continuously, across step
    boundaries, from pinned RAM and from NVMe (O_DIRECT, read by a background thread).
 3. **27 % of FLUX depends only on the timestep and the prompt.** selas computes those modulation layers for
-   every step up front. They are read once per image instead of once per step. This is exact.
+   every step up front. They are read once per image instead of once per step, and the resulting vectors
+   are cached on disk: a new seed for the same prompt does not load those 6 GiB at all. This is exact.
 4. **It calibrates itself.** Disk bandwidth, per-block compute time and activation memory are measured
    during normal runs and cached. The planner's predictions improve after the first run, and the VRAM it
    sets aside for activations shrinks to what the model really needs.
-5. **Caching at every level.** Prompt embeddings are cached on disk, so a new seed never loads T5. Optionally,
-   steps that barely differ from the last one can reuse its result (`--cache fbcache`). This is ~35 % faster
-   and approximate.
+5. **Caching at every level.** Prompt embeddings and modulation vectors are cached on disk, so a new seed
+   never loads T5 or the modulation layers. Optionally, steps that barely differ from the last one can reuse
+   its result (`--cache fbcache`). This is ~35 % faster and approximate.
+6. **Fused kernels, compiled while loading.** In eager PyTorch a quarter of a step went to small memory-bound
+   ops between the matmuls (norms, modulation, RoPE, residual adds). selas fuses them with `torch.compile`,
+   on a background thread while the weights load, for 1.2× faster steps at the same accuracy.
+7. **Denoising starts before loading ends.** Weights are read in the order of first use on a background
+   thread; the prologue and the first step wait for each block only until it arrives. Loading itself is
+   disk-bound: pinning RAM overlaps the reads.
 
 ## Requirements
 
-* Linux, an NVIDIA GPU with CUDA, Python ≥ 3.10, PyTorch ≥ 2.4.
+* Linux, an NVIDIA GPU with CUDA, Python ≥ 3.10, PyTorch ≥ 2.4 (≥ 2.7 for `--fp16-accum`). Fused kernels need
+  Triton, which the Linux PyTorch wheels include; without it selas runs eager kernels.
 * RAM for the weights that are not in VRAM. For full-precision FLUX.1-dev at minimal VRAM that is ~16 GB of
   pinned RAM. With less, the rest streams from disk (an NVMe is recommended).
 * Disk space for the converted model: ~32 GB at full precision, ~11 GB for NF4.
@@ -118,8 +130,11 @@ selas generate --model models/flux1-dev -p "a red fox in fresh snow" --vram-gb 2
 | `--steps`, `--guidance`, `--seed`, `--count`, `--prompt-file` | the usual; `--count N` makes N seeds per prompt |
 | `--batch-size N` | denoise N images together: one weight transfer serves all of them |
 | `--cache fbcache` | step caching, **approximate**: ~35 % faster at the default `--cache-threshold 0.08`; quality varies by prompt |
+| `--fp16-accum` | fp16 matmuls accumulate in fp16: ~1.6× faster steps on GeForce cards, **approximate** |
+| `--no-compile` | eager PyTorch kernels instead of fused ones (the 0.1.0 numerics) |
 | `--vae-tile on` | decode in tiles: less VRAM, slightly different pixels |
 | `--no-direct-io` | read the disk tier through the page cache instead of O_DIRECT |
+| `--no-prompt-cache` | neither read nor write the prompt-embedding and modulation caches |
 | `--reserve-gb` | override the learned activation reserve |
 | `--placement first:N\|host\|disk\|vram` | fixed placements, for comparing against the planner |
 | `--profile` | measure transfer stalls and per-block compute |
@@ -137,11 +152,15 @@ throughput), `selas verify --model …` (re-hashes every unit), `selas compare a
   small objects.
 * `--cache tiered` (recompute resident blocks, reuse streamed ones) is experimental and measured no better
   than `fbcache`.
+* Fused kernels are as accurate as eager PyTorch but round differently, so some prompts give a different
+  (equally valid) image than `--no-compile`. The first run at a new image size compiles for 15–25 s; after
+  that the compiled kernels load from `~/.cache/selas/inductor` in ~3 s, alongside the weights.
 
 ## Experiments
 
 `experiments/` holds the scripts behind the measurements in [docs/PLAN.md](docs/PLAN.md) §7: `placement`,
-`batching`, `cache_predict` and `disk_io`. They write raw results to `experiments/results/`.
+`batching`, `cache_predict`, `disk_io`, `kernels` and `kernel_error`. They write raw results to
+`experiments/results/`.
 
 ```bash
 python -m experiments.placement --model models/flux1-dev

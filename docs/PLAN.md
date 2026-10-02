@@ -169,6 +169,15 @@ The **planner** chooses that subset with a pipeline simulator:
 * Pinned memory is one `mmap` region registered with `cudaHostRegister`
   (PyTorch's pinned allocator rounds to powers of two, which would waste up to
   2× RAM at these sizes).
+* **Progressive start**: a store returns once its buffers are allocated, and a
+  background thread reads the units in order of first use (globals, the
+  modulation units if the prologue needs them, then the blocks in schedule
+  order). VRAM-resident units pass through a two-slot pinned scratch and are
+  copied on their own stream; host-tier units are read straight into their slice
+  of the pool, which a second thread pins while a third pre-faults pages ahead of
+  the reader. Consumers wait per unit (the CPU until it is read, the GPU only on
+  its copy event), so the prologue runs while the blocks load and the first step
+  overlaps the end of the load. A loader error is raised to the next waiter.
 
 ### 3.4 Exact compute path on Turing
 
@@ -180,15 +189,28 @@ The **planner** chooses that subset with a pipeline simulator:
 * T5-XXL runs in **fp32** (it overflows in fp16), streamed block-by-block like
   the transformer; CLIP and VAE in fp32.
 * Attention via PyTorch SDPA (memory-efficient kernel on Turing).
+* **Fused elementwise kernels** (default on CUDA): eager PyTorch spent 22–26 % of a
+  1024² step on memory-bound elementwise ops between the matmuls (LayerNorm +
+  modulation, QK-RMSNorm + RoPE, gated residual adds, GELU, concatenations; profile
+  of one block: matmuls 52–56 %, attention 22 %). The blocks are written as
+  matmuls/attention plus seven pure elementwise *segments*, each compiled by
+  `torch.compile` into one Triton kernel with the same fp32 math. They are compiled
+  on a background thread while the weights load, on stand-in weights that return
+  zeros of the right shapes, so the real run starts with every kernel ready. Not
+  bitwise equal to eager (`--no-compile`), but equally accurate: see §7.
+* `--fp16-accum` (opt-in, approximate): GeForce Turing runs fp16 matmuls with
+  fp32 accumulation at half rate; accumulating in fp16 is 1.66× faster per matmul
+  and has 2.6× the per-step error.
 
 ### 3.5 Caching — the answer to "can previously-used nodes be cached?"
 
-Yes, at four levels:
+Yes, at five levels:
 
 | level | what is cached | exact? |
 |---|---|---|
 | **Weights** | resident set (Belady), host tier, OS page cache | exact |
 | **Condition-only nodes** | modulation vectors for all steps, `txt_in(T5)`, RoPE tables, time/guidance embeddings — computed once per image | exact |
+| **Modulation vectors** | each image's vectors on disk, keyed by its pooled CLIP vector, guidance and σ schedule: a new seed for a cached prompt does not load the modulation units (6 GiB) | exact |
 | **Prompts** | T5 + CLIP outputs on disk keyed by prompt + model hash: re-seeding a prompt never loads T5 | exact |
 | **Activations across steps** | block residuals reused on steps where the model's output barely changes | **approximate, opt-in** |
 
@@ -300,6 +322,14 @@ times drift by ~5 %; A/B comparisons were run in ABBA or forward+reverse order t
 | Linear residual extrapolation beats reuse at equal skip rate | fbcache, 3 prompts, 1024², 28 steps, PSNR vs exact | **confirmed, modestly**. Threshold 0.08 (10–11/28 skipped, identical schedules): linear 32.37 dB vs reuse 30.36 dB mean (+2.0; per prompt +3.5, +0.1, +2.5). Threshold 0.15 (16/28 skipped), linear replaying reuse's exact schedule: 23.64 vs 23.01 dB (+0.6; one prompt −0.5). Same wall time |
 | Block-major micro-batching makes 512² compute-bound | 512², batch × micro, 10 steps, forward + reverse order | **true but nearly irrelevant here**: batch 1 is only marginally transfer-bound (22–93 ms stall/step) because the planner keeps ~18–20 blocks resident and spread. Batch 2: −8 % time per image (0.812 vs 0.878 s/image-step); batch 4: −7 %; batch 8: −2 %. Micro-batch 1 inside batch 4 gains nothing (0.882), so the gain is GEMM size, not hidden transfers |
 | O_DIRECT helps on this NVMe | microbenchmark + engine A/B (512², `--ram-gb 6`, 4.85–5.06 GiB/step from disk), page cache evicted per run | **confirmed**. Cold reads: 3.28 GiB/s O_DIRECT vs 2.19 GiB/s buffered, at ⅓ the CPU (0.16 vs 0.47 s/GiB). Engine with free RAM: equal (1.49 vs 1.54 s/step; buffered is served by the page cache after step 1). Engine inside a cgroup capping page cache at ~1.5 GiB (RAM really short, the case the disk tier exists for): **O_DIRECT 1.47 s/step vs buffered 2.78 s/step (1.9×)** |
+| Fusing the elementwise ops between matmuls speeds up compute-bound steps without losing accuracy | `kernels`: eager vs fused (`torch.compile`), 1024², 28 steps, ABBA on one prompt + 3 prompts for quality; `kernel_error`: one step from the same latents vs an fp32 reference, 3 prompts × 6 steps | **confirmed**. 2.77 → 2.32 s/step (**1.20×**; 1.20× in an isolated block benchmark at cooler clocks). Error of one step's velocity vs fp32: **4.61·10⁻³ fused vs 4.60·10⁻³ eager** (max 1.35 vs 1.34·10⁻²): rounding differs, accuracy does not. Images vs eager: 49 dB on the fox, but 24 and 35 dB on the interior and the ink illustration, whose trajectories tip into a different (equally valid) sample on any rounding change; `--no-compile` reproduces eager. Compiling takes ~3 s from cache, hidden behind loading; a new image size costs 16–25 s once |
+| fp16 accumulation is a usable speed/quality trade on GeForce Turing | as above, `--fp16-accum` | **opt-in only**. 1.74 s/step (**1.59×** vs eager; matmuls 41 → 68 TFLOP/s), but per-step error 1.20·10⁻² (2.6× eager); images 38 dB on the fox, 24–25 dB on the others (where fused alone already diverges). A speed-up like `fbcache`'s, with the error spread over every step instead of concentrated in skipped ones |
+| A Triton flash-attention kernel beats PyTorch's SDPA on Turing | forward kernel, L = 1536–4608, 24 heads × 128, swept tile sizes | **refuted**. SDPA (CUTLASS memory-efficient kernel) 23–27 TFLOP/s; Triton 0.5 TFLOP/s with fp32 accumulation and 6 TFLOP/s with fp16 accumulation: Triton's Turing tensor-core path is far behind |
+| Transparent huge pages make pinning RAM cheaper | `cudaHostRegister` of an `MADV_HUGEPAGE` mapping, 4 GiB then the real 15.5 GiB pool | **refuted at scale**. 4 GiB: 0.20 vs 0.61 s/GiB. Real pool on a desktop that had been up for hours: ~10k compaction stalls, 40 % of faults fell back to small pages, load 20.8 s vs 15.9 s without |
+| Loading can be made disk-bound | default 1024² plan (15.5 GiB pinned + 6.9 GiB VRAM-resident), timed phases | **confirmed**. Registering faulted in every page single-threaded (9.3 s of a 15.9 s load) and serialized with the reads. Pre-faulting pages on 8 threads (0.1 s/GiB), then registering on a thread while the weights are read: **8.7 s** (22.2 GiB at 3.3 GiB/s is 6.7 s). Unpinning is cheap (0.02 s/GiB); unmapping (0.12 s/GiB, ~1.9 s) now runs in the background during VAE decoding |
+| A new seed for a cached prompt does not need the modulation weights | 1024², 28 steps, same prompt with its modulation vectors computed vs cached, ABBA; also 8 steps | **confirmed**. Cached, the modulation units (6 GiB) are not loaded: pinned host tier 15.9 → 9.9 GiB, loading 7.7 → 6.0 s, prologue 0.79 → 0.25 s, first step done 2.3 s sooner when waiting for the load and 1.8 s sooner with progressive start (8 steps, earlier code: 39.0 → 33.0 s end to end). Exact: identical latents, also for a partial hit and for a batch vs single images (tests). 2.1 MB per image and step on disk |
+| Denoising can start before the weights finish loading | 1024², 28 steps: the current code vs the same code waiting for the load and the kernel compile before the prologue, ABBA; time at which step 1 ends | **confirmed, 1.3–1.9 s**. Vectors computed: step 1 done at 13.5 and 11.9 s vs 14.6 and 14.5 s; cached: 10.9 and 10.9 s vs 12.2 and 12.3 s. The prologue runs while the blocks load (2.7 s instead of 0.8 s, hidden). The gain is bounded: a step needs every block, so step 1 cannot end before the last one arrives (8 s), and it cannot start before the kernels are compiled |
+| Deferring the pinning until the kernels are compiled lets the first step start sooner | as above, ABBA; host units pinned only after the compile (or when a consumer waits for one) | **refuted**. The compile finished 1–1.5 s sooner (4.5–4.7 s vs 5.2–6.1 s with cached vectors), but the deferred pinning then ran in one burst holding the driver lock that the first step's launches need: step 1 ended at 12.2 and 12.6 s vs 12.7 and 11.5 s (cached), 12.3 and 12.9 s vs 12.6 and 12.3 s (computed). Pinning 10–16 GiB costs 2–3 s of driver time, which can be moved but not hidden |
 
 ### 7.1 Measured so far
 
@@ -341,6 +371,22 @@ model's ratio with × 1.15 + 256 MiB. If a learned reserve runs out of VRAM, the
 once on the analytic estimate and the margins widen ×1.5. Result: the default 1024² plan reserves
 0.89 instead of 1.40 GiB (one more resident block), and `--vram-gb 2` alone runs full fp16
 FLUX.1-dev at 1024² in a 2,030 MiB process (incl. CUDA context), 2.74 s/step.
+
+End to end, one 1024² image from the CLI (28 steps, prompt cached, GPU at 84–85 °C), the 0.1.0 code
+and the current code run alternately: 0.1.0 took 101.5, 101.4 and 109.0 s (2.74–2.97 s/step, loading
+16.8–17.8 s); now 83.5 and 85.3 s (2.20–2.31 s/step, loading 9.5–11.3 s with the kernels compiling
+alongside), **−19 %** on the means; `--fp16-accum` 68.8 s (1.73 s/step), `--vram-gb 2` 88.7 s at 1.9 GiB of process
+VRAM. A third run of the current code (116 s, 3.43 s/step, slow prologue) coincided with other GPU work
+on the desktop and was repeated. Loading alone is 8.7 s; compiling alongside it costs ~3 s more, because
+`cudaHostRegister` holds the CUDA driver lock that loading compiled kernels needs (compiled alone: 3.4 s
+from cache), so the overlap saves little time but keeps compilation out of the first step and out of the
+calibration. Dynamic-shape compilation (one graph per segment for all image sizes) was tried and
+rejected: 11–13 % slower kernels and a 10 s cached warm-up. Releasing the pinned pool with `munmap`
+in the background stalled the VAE's own pinned buffer for ~2 s (it holds the address-space lock for
+writing); freeing the pages with `MADV_DONTNEED` in 64 MiB chunks first lets it through in 0.2 s.
+Later, denoising started during the load (the first step ends 1.3–1.9 s sooner than with the same code
+waiting for it) and re-seeding a prompt stopped loading the modulation weights (the first step ends a
+further 1.8 s sooner): 77–84 s per image at 2.13–2.43 s/step, within the thermal drift of the runs above.
 
 Bugs found by the real-model run: random pooled vectors are off CLIP's output manifold and
 drive FLUX modulations to ~5·10⁴ (in fp32 too), overflowing any fp16 forward — tests now use

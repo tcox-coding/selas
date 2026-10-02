@@ -128,3 +128,37 @@ def test_oom_with_estimated_reserve_is_not_swallowed(tiny_engine, monkeypatch):
     monkeypatch.setattr(FluxRunner, "step", oom)
     with pytest.raises(torch.cuda.OutOfMemoryError):
         eng._denoise_safe([Job("p", seed=0, width=64, height=64, steps=3)], embeds, StepCacheConfig())
+
+
+@needs_cuda
+def test_warm_up_compiles_everything_the_run_needs(tiny_engine):
+    """Kernels compile while the weights load; compiling mid-run would stall step 1 and skip learning."""
+    from selas.models.flux import compile_count
+    from selas.pipeline import Job
+    from selas.stepcache import StepCacheConfig
+
+    eng, embeds = tiny_engine
+    if not eng.kernels.compiled:
+        pytest.skip("torch.compile unavailable")
+    eng.ensure_loaded(64, 64, 1, 3, StepCacheConfig())
+    n = compile_count()
+    eng.denoise([Job("p", seed=0, width=64, height=64, steps=3)], embeds, StepCacheConfig())
+    assert compile_count() == n
+
+
+@needs_cuda
+def test_compute_calibration_is_kept_per_numerics_mode(tiny_engine):
+    """--fp16-accum runs are ~1.6x faster: their calibration must not overwrite the default's."""
+    from selas.pipeline import Job
+    from selas.stepcache import StepCacheConfig
+
+    eng, embeds = tiny_engine
+    jobs = [Job("p", seed=0, width=64, height=64, steps=3)]
+    eng.denoise(jobs, embeds, StepCacheConfig())
+    default = {k for k in _profile(eng) if k.startswith(("double", "single"))}
+    assert default == {eng._calib_key("double"), eng._calib_key("single")}
+    eng.fp16_accum = True
+    eng.denoise(jobs, embeds, StepCacheConfig())
+    mode = "fused" if eng.kernels.compiled else "eager"
+    added = {k for k in _profile(eng) if k.startswith(("double", "single"))} - default
+    assert added == {f"double|{mode}+acc16", f"single|{mode}+acc16"}

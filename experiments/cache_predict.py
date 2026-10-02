@@ -59,7 +59,9 @@ def run(eng, prompts, res, steps, cfg: StepCacheConfig, tag: str, replay=None) -
         st = r.stats
         out.append({"tag": tag, "prompt": i, "image": str(path.relative_to(ROOT)), "decisions": st["decisions"],
                     "skipped": sum(d != "full" for d in st["decisions"]),
-                    "denoise_s": st["prologue_s"] + sum(st["step_s"]), "_img": r.image})
+                    # steps only: the prologue is the same for every policy, but it overlaps loading and
+                    # skips its work when the modulation vectors are cached, so its time varies by run order
+                    "denoise_s": sum(st["step_s"]), "_img": r.image})
     return out
 
 

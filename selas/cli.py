@@ -23,6 +23,10 @@ def _add_runtime(p: argparse.ArgumentParser) -> None:
     g.add_argument("--dtype", default="auto", choices=["auto", "fp16", "bf16", "fp32"], help="compute dtype")
     g.add_argument("--direct-io", action=argparse.BooleanOptionalAction, default=True,
                    help="O_DIRECT reads for the disk tier (default; --no-direct-io uses the page cache)")
+    g.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="fuse the elementwise kernels with torch.compile (default on CUDA; --no-compile runs eager PyTorch)")
+    g.add_argument("--fp16-accum", action="store_true",
+                   help="fp16 matmuls accumulate in fp16: ~1.6x faster matmuls on GeForce cards, approximate")
     g.add_argument("--profile", action="store_true", help="measure transfer stalls and per-block compute")
     g.add_argument("--device", type=int, help="CUDA device index")
 
@@ -50,6 +54,7 @@ def _runtime(a):
     return RuntimeOptions(
         device=a.device, dtype=a.dtype, vram_gb=a.vram_gb, ram_gb=a.ram_gb, reserve_gb=a.reserve_gb,
         direct_io=a.direct_io, profile=a.profile, micro_batch=a.micro_batch, placement=a.placement,
+        compile=a.compile, fp16_accum=a.fp16_accum,
         vae_tile=getattr(a, "vae_tile", "auto"), prompt_cache=not getattr(a, "no_prompt_cache", False),
     )
 
@@ -148,10 +153,13 @@ def cmd_generate(a) -> int:
     single = len(results) == 1 and out.suffix.lower() == ".png"
     if not single:
         out.mkdir(parents=True, exist_ok=True)
+    numerics = f", Kernels: {'fused' if eng.kernels.compiled else 'eager'}"
+    if eng.fp16_accum:
+        numerics += ", Matmul accumulation: fp16 (approximate)"
     for i, r in enumerate(results):
         path = out if single else out / f"selas_{r.job.seed}_{i:03d}.png"
         meta = PngInfo()
-        for k, v in png_metadata(r.job, eng.defaults, cache_cfg).items():
+        for k, v in png_metadata(r.job, eng.defaults, cache_cfg, numerics).items():
             meta.add_text(k, v)
         r.image.save(path, pnginfo=meta)
         print(path)
@@ -293,6 +301,9 @@ def main(argv: list[str] | None = None) -> int:
     if a.quiet:
         util.VERBOSITY = 0
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # compiled kernels: a cold compile is ~16 s per new image size, a cached one ~3 s (hidden behind
+    # loading); PyTorch's default cache lives in /tmp, which the OS may clean
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(util.user_cache_dir() / "inductor"))
     return int(a.fn(a) or 0)
 
 

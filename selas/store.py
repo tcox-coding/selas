@@ -6,6 +6,8 @@ Every unit of a container lives in exactly one tier:
 * ``host`` — page-locked RAM; streamed to the GPU by DMA on a copy stream.
 * ``disk`` — the container on NVMe; a reader thread ``pread``s it into a pinned
   staging ring ahead of time, then it is streamed like a host unit.
+* ``absent`` — not loaded at all (e.g. modulation units when every image's
+  modulation vectors are cached); using it is an error.
 
 Non-resident units flow through a VRAM *ring arena* (see :mod:`selas.arena`)
 in a fixed, known order (:class:`UnitStream`). Because the order is known in
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import gc
 import mmap
+import os
 import threading
 import time
 from collections import deque
@@ -41,8 +44,8 @@ from .codecs import decode
 from .container import Container, UnitSpec, part_view
 from .util import align_up, human_bytes, log, warn
 
-VRAM, HOST, DISK = "vram", "host", "disk"
-TIERS = (VRAM, HOST, DISK)
+VRAM, HOST, DISK, ABSENT = "vram", "host", "disk", "absent"
+TIERS = (VRAM, HOST, DISK, ABSENT)
 
 
 # --------------------------------------------------------------------------- pinned host memory
@@ -55,28 +58,89 @@ def _cuda_ok(err) -> bool:
         return str(err).endswith("success")
 
 
+def _prefault(buf: torch.Tensor, threads: int = 8, min_bytes: int = 256 << 20) -> None:
+    """Touch one byte per page of a fresh mapping, from several threads (torch releases the GIL)."""
+    n = buf.numel()
+    k = min(threads, os.cpu_count() or 1, max(1, n // min_bytes))
+    step = align_up(-(-n // k), 4096)
+    parts = [buf[a : min(n, a + step) : 4096] for a in range(0, n, step)]
+    if len(parts) == 1:
+        parts[0].fill_(0)
+        return
+    ts = [threading.Thread(target=p.fill_, args=(0,)) for p in parts]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+
+_releasing: list[threading.Thread] = []
+
+
+def _release_later(fn) -> None:
+    t = threading.Thread(target=fn, name="selas-unmap")  # not a daemon: the interpreter waits for it
+    t.start()
+    _releasing.append(t)
+
+
+def wait_released() -> None:
+    """Wait for pools being unmapped in the background (so RAM is not held twice)."""
+    while _releasing:
+        _releasing.pop().join()
+
+
 class PinnedPool:
     """One page-aligned anonymous mapping, page-locked with ``cudaHostRegister``.
 
     PyTorch's pinned allocator rounds every allocation up to a power of two, which
     would waste up to 2x RAM for multi-GiB weight sets; registering our own mapping
     pins exactly what we use. Slices are handed out bump-allocator style.
+
+    Registering faults in and zeroes every page first, single-threaded (~0.6 s/GiB);
+    the pages are faulted in parallel beforehand instead (~0.1 s/GiB on 8 threads),
+    which leaves registration only the pinning (~0.2 s/GiB). ``pin=True`` pins the
+    whole pool now; with ``pin=False`` the owner pins slices as it fills them
+    (:meth:`register`), each slice a separate range: the driver lock is then held
+    in short pieces, and a copy must not span two ranges. (Transparent huge pages
+    would make pinning cheaper still, but on a fragmented desktop their compaction
+    stalls made loading slower.)
     """
 
     def __init__(self, nbytes: int, pin: bool = True):
         self.nbytes = align_up(max(int(nbytes), 4096), 4096)
+        if _releasing:  # a small pool (e.g. the VAE's) may overlap an old pool's release; a large one waits
+            from .hw import ram_available
+
+            if ram_available()[1] < self.nbytes + (2 << 30):
+                wait_released()
         self._mm = mmap.mmap(-1, self.nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         self.base = torch.frombuffer(self._mm, dtype=torch.uint8)
-        self.pinned = False
+        self._regs: list[int] = []  # start addresses of registered ranges
+        self._lock = threading.Lock()
+        self._warned = False
         if pin and torch.cuda.is_available():
-            try:
-                err = torch.cuda.cudart().cudaHostRegister(self.base.data_ptr(), self.nbytes, 0)
-                self.pinned = _cuda_ok(err)
-            except Exception as e:  # pragma: no cover
-                warn(f"cudaHostRegister unavailable ({e})")
-            if not self.pinned:
-                warn(f"could not page-lock {human_bytes(self.nbytes)} of host memory; host->device copies will be slower")
+            _prefault(self.base)
+            self.register(self.base)
         self._cursor = 0
+
+    @property
+    def pinned(self) -> bool:
+        return bool(self._regs)
+
+    def register(self, t: torch.Tensor) -> bool:
+        """Page-lock a slice of the pool (already faulted in, ideally) as its own range."""
+        try:
+            ok = _cuda_ok(torch.cuda.cudart().cudaHostRegister(t.data_ptr(), align_up(t.numel(), 4096), 0))
+        except Exception as e:  # pragma: no cover
+            ok = False
+            warn(f"cudaHostRegister unavailable ({e})")
+        with self._lock:
+            if ok:
+                self._regs.append(t.data_ptr())
+            elif not self._warned:
+                self._warned = True
+                warn(f"could not page-lock host memory ({human_bytes(t.numel())}); host->device copies will be slower")
+        return ok
 
     def take(self, n: int, align: int = 4096) -> torch.Tensor:
         off = align_up(self._cursor, align)
@@ -90,21 +154,86 @@ class PinnedPool:
     def used(self) -> int:
         return self._cursor
 
-    def close(self) -> None:
+    def close(self, unmap_async: bool = False) -> None:
+        """Unpin (cheap: ~0.02 s/GiB) and unmap (frees the pages: ~0.12 s/GiB). With ``unmap_async``
+        the unmapping runs on a background thread; it involves no CUDA calls, so GPU work proceeds."""
         if self.base is None:
             return
-        if self.pinned:
+        with self._lock:
+            regs, self._regs = self._regs, []
+        for ptr in regs:
             try:
-                torch.cuda.cudart().cudaHostUnregister(self.base.data_ptr())
+                torch.cuda.cudart().cudaHostUnregister(ptr)
             except Exception:  # pragma: no cover
                 pass
-            self.pinned = False
         self.base = None
+        if unmap_async:
+            _release_later(self._unmap)
+        else:
+            self._unmap()
+
+    def _unmap(self, chunk: int = 64 << 20) -> None:
         gc.collect()
+        # Free the pages in chunks first: munmap holds the address-space lock for writing the whole
+        # time (~2 s for 15 GiB), stalling every page fault and pinning elsewhere in the process (the
+        # VAE loading meanwhile); MADV_DONTNEED frees the same pages under the read lock, a chunk at a
+        # time. A slice still referenced somewhere would read zeros afterwards, never fault.
+        if hasattr(mmap, "MADV_DONTNEED"):
+            try:
+                for off in range(0, self.nbytes, chunk):
+                    self._mm.madvise(mmap.MADV_DONTNEED, off, min(chunk, self.nbytes - off))
+            except (OSError, ValueError):
+                pass
         try:
             self._mm.close()
         except BufferError:  # a slice is still referenced; the mapping is freed when it is collected
             pass
+
+
+class _Prefaulter:
+    """Faults in a fresh mapping front to back on several threads, ahead of a reader:
+    ``wait(end)`` returns once ``[0, end)`` is faulted in."""
+
+    def __init__(self, buf: torch.Tensor, threads: int = 8, chunk: int = 64 << 20):
+        self.buf, self.chunk = buf, chunk
+        self.n = buf.numel()
+        self.nchunks = -(-self.n // chunk)
+        self.next = 0
+        self.done = [False] * self.nchunks
+        self.prefix = 0  # chunks [0, prefix) are done
+        self.stop = False
+        self.cond = threading.Condition()
+        k = min(threads, os.cpu_count() or 1, self.nchunks)
+        self.threads = [threading.Thread(target=self._work, name="selas-prefault", daemon=True) for _ in range(k)]
+        for t in self.threads:
+            t.start()
+
+    def _work(self) -> None:
+        while True:
+            with self.cond:
+                if self.stop or self.next >= self.nchunks:
+                    return
+                i = self.next
+                self.next += 1
+            a = i * self.chunk
+            self.buf[a : min(self.n, a + self.chunk) : 4096].fill_(0)
+            with self.cond:
+                self.done[i] = True
+                while self.prefix < self.nchunks and self.done[self.prefix]:
+                    self.prefix += 1
+                self.cond.notify_all()
+
+    def wait(self, end: int) -> None:
+        with self.cond:
+            while self.prefix * self.chunk < end and self.prefix < self.nchunks and not self.stop:
+                self.cond.wait(0.1)
+
+    def close(self) -> None:
+        with self.cond:
+            self.stop = True
+            self.cond.notify_all()
+        for t in self.threads:
+            t.join()
 
 
 # --------------------------------------------------------------------------- views
@@ -204,7 +333,14 @@ class StreamStats:
 
 
 class WeightStore:
-    """Owns one container's units across the VRAM / host / disk tiers."""
+    """Owns one container's units across the VRAM / host / disk tiers.
+
+    On CUDA, construction only allocates: the units are read on a background
+    thread in ``order`` (their first use; the rest after), so compute starts while
+    the weights are still loading. :meth:`view` and the streams wait for each unit
+    as needed (the CPU until it is read, the GPU until it is copied);
+    :meth:`wait_loaded` waits for all of them.
+    """
 
     def __init__(
         self,
@@ -217,6 +353,7 @@ class WeightStore:
         direct_io: bool = False,
         profile: bool = False,
         label: str = "",
+        order: list[str] | None = None,
     ):
         self.c = container
         self.units = container.units
@@ -234,19 +371,19 @@ class WeightStore:
                 raise ValueError(f"bad tier {t!r} for {name}")
             self.tier[name] = t
         if self.device.type != "cuda":  # CPU execution (tests): everything is "resident"
-            self.tier = {n: VRAM for n in self.units}
+            self.tier = {n: (ABSENT if t == ABSENT else VRAM) for n, t in self.tier.items()}
+        first = [n for n in dict.fromkeys(order or []) if n in self.units]
+        self.order = first + [n for n in self.units if n not in set(first)]  # load order
 
-        vram_units = [n for n, t in self.tier.items() if t == VRAM]
-        host_units = [n for n, t in self.tier.items() if t == HOST]
-        disk_units = [n for n, t in self.tier.items() if t == DISK]
+        vram_units = [n for n in self.order if self.tier[n] == VRAM]
+        host_units = [n for n in self.order if self.tier[n] == HOST]
+        disk_units = [n for n in self.order if self.tier[n] == DISK]
         if disk_units:
             staging_bytes = max(staging_bytes, 2 * max(self.units[n].nbytes for n in disk_units))
         else:
             staging_bytes = 0
         self.staging_bytes = staging_bytes
-        load_bytes = max((self.units[n].nbytes for n in vram_units), default=0) if self.device.type == "cuda" else 0
-        shared = max(staging_bytes, load_bytes)
-        host_bytes = sum(align_up(self.units[n].nbytes, 4096) for n in host_units)
+        self.host_bytes = sum(align_up(self.units[n].nbytes, 4096) for n in host_units)
 
         self.pool: PinnedPool | None = None
         self.host: dict[str, torch.Tensor] = {}
@@ -255,71 +392,209 @@ class WeightStore:
         self.arena_buf: torch.Tensor | None = None
         self.arena: RingArena | None = None
         self.copy_stream = torch.cuda.Stream(self.device) if self.device.type == "cuda" else None
+        self._ready: dict[str, threading.Event] = {}  # unit -> read (host: and pinned; vram: copy issued)
+        self._copied: dict[str, torch.cuda.Event] = {}  # vram unit -> its H2D copy, on the load stream
+        self._loader: threading.Thread | None = None
+        self._load_error: BaseException | None = None
+        self._stop = False
 
-        t0 = time.perf_counter()
+        self._t0 = time.perf_counter()
         try:
-            self._load(vram_units, host_units, disk_units, host_bytes, shared, arena_bytes)
+            self._setup(vram_units, host_units, disk_units, arena_bytes)
         except BaseException:
             self.close()  # never leak page-locked memory or device buffers on a failed load
             raise
+        if self._loader is None:
+            self._log_loaded()
 
-        vb = sum(self.units[n].nbytes for n in vram_units)
-        db = sum(self.units[n].nbytes for n in disk_units)
-        log(
-            f"{self.label}: vram {len(vram_units)} units {human_bytes(vb)}, host {len(host_units)} units "
-            f"{human_bytes(host_bytes)}, disk {len(disk_units)} units {human_bytes(db)}, "
-            f"arena {human_bytes(self.arena_buf.numel() if self.arena_buf is not None else 0)}, "
-            f"staging {human_bytes(self.staging_bytes)} (loaded in {time.perf_counter() - t0:.1f}s)"
-        )
+    def _summary(self) -> str:
+        vb = sum(self.units[n].nbytes for n, t in self.tier.items() if t == VRAM)
+        db = sum(self.units[n].nbytes for n, t in self.tier.items() if t == DISK)
+        count = lambda tier: sum(1 for t in self.tier.values() if t == tier)  # noqa: E731
+        return (f"{self.label}: vram {count(VRAM)} units {human_bytes(vb)}, host {count(HOST)} units "
+                f"{human_bytes(self.host_bytes)}, disk {count(DISK)} units {human_bytes(db)}, "
+                f"arena {human_bytes(self.arena_buf.numel() if self.arena_buf is not None else 0)}, "
+                f"staging {human_bytes(self.staging_bytes)}")
 
-    def _load(self, vram_units, host_units, disk_units, host_bytes: int, shared: int, arena_bytes: int) -> None:
-        direct_io, dtype, staging_bytes = self.direct_io, self.dtype, self.staging_bytes
-        if self.device.type == "cuda" and (host_bytes or shared):
-            self.pool = PinnedPool(host_bytes + shared)
-            for n in host_units:
-                buf = self.pool.take(self.units[n].nbytes)
-                self.c.read_unit_into(self.units[n], buf, direct=direct_io)
-                self.host[n] = buf
-            if shared:
-                scratch = self.pool.take(shared)
-                self.staging = scratch[:staging_bytes] if staging_bytes else None
-            else:
-                scratch = None
-        else:
-            scratch = None
+    def _log_loaded(self, background: bool = False) -> None:
+        log(f"{self._summary()} (loaded in {time.perf_counter() - self._t0:.1f}s{', in the background' if background else ''})")
 
+    def _setup(self, vram_units, host_units, disk_units, arena_bytes: int) -> None:
+        if self.device.type != "cuda":
+            for n in vram_units:
+                dev = torch.empty(self.units[n].nbytes, dtype=torch.uint8)
+                self.c.read_unit_into(self.units[n], dev)
+                self.views[n] = UnitView(self.units[n], dev, self.dtype)
+            return
+        if self.host_bytes or self.staging_bytes:
+            self.pool = PinnedPool(self.host_bytes + self.staging_bytes, pin=False)
+            for n in host_units:  # in load order: the prefaulter runs ahead of the reader
+                self.host[n] = self.pool.take(self.units[n].nbytes)
+            if self.staging_bytes:
+                self.staging = self.pool.take(self.staging_bytes)
+                _prefault(self.staging)
+                self.pool.register(self.staging)
         for n in vram_units:
-            spec = self.units[n]
-            if self.device.type == "cuda":
-                assert scratch is not None
-                self.c.read_unit_into(spec, scratch, direct=direct_io)
-                dev = torch.empty(spec.nbytes, dtype=torch.uint8, device=self.device)
-                dev.copy_(scratch[: spec.nbytes])  # synchronous: scratch is reused next iteration
-            else:
-                dev = torch.empty(spec.nbytes, dtype=torch.uint8)
-                self.c.read_unit_into(spec, dev)
-            self.views[n] = UnitView(spec, dev, dtype)
-
-        if arena_bytes and self.device.type == "cuda" and (host_units or disk_units):
+            dev = torch.empty(self.units[n].nbytes, dtype=torch.uint8, device=self.device)
+            self.views[n] = UnitView(self.units[n], dev, self.dtype)
+        if arena_bytes and (host_units or disk_units):
             max_streamed = max(self.units[n].nbytes for n in host_units + disk_units)
             arena_bytes = max(int(arena_bytes), max_streamed)
             self.arena_buf = torch.empty(arena_bytes, dtype=torch.uint8, device=self.device)
             self.arena = RingArena(arena_bytes)
-        elif (host_units or disk_units) and self.device.type == "cuda":
+        elif host_units or disk_units:
             raise ValueError(f"{self.label}: streamed units need a non-zero arena")
+        todo = [n for n in self.order if self.tier[n] in (VRAM, HOST)]
+        if not todo:
+            return
+        self._ready = {n: threading.Event() for n in todo}
+        self._loader = threading.Thread(target=self._load, args=(todo,), name=f"selas-load-{self.label}", daemon=True)
+        self._loader.start()
+
+    # ------------------------------------------------------------------ background loading
+    def _load(self, todo: list[str]) -> None:
+        """Loader thread: read every VRAM/host unit in load order.
+
+        VRAM units go through a two-slot pinned scratch (read one while the other is
+        copied). Host units are read straight into their pool slice, which a second
+        thread then pins; the pages were faulted in ahead of the reads by a third.
+        """
+        units, direct = self.units, self.direct_io
+        vram = [n for n in todo if self.tier[n] == VRAM]
+        host = [n for n in todo if self.tier[n] == HOST]
+        scratch_pool = prefaulter = None
+        pin_q: deque = deque()
+        pin_cond = threading.Condition()
+        pinner = None
+
+        def pin_loop() -> None:
+            while True:
+                with pin_cond:
+                    while not pin_q:
+                        pin_cond.wait()
+                    name = pin_q.popleft()
+                if name is None:
+                    return
+                if not self._stop:
+                    self.pool.register(self.host[name])
+                self._ready[name].set()
+
+        try:
+            with torch.cuda.device(self.device):
+                load_stream = torch.cuda.Stream(self.device)
+                if vram:
+                    slot = max(units[n].nbytes for n in vram)
+                    scratch_pool = PinnedPool(slot * min(2, len(vram)))
+                    slots = [scratch_pool.base[i * slot : (i + 1) * slot] for i in range(min(2, len(vram)))]
+                    slot_done: list[torch.cuda.Event | None] = [None] * len(slots)
+                if host:
+                    prefaulter = _Prefaulter(self.pool.base[: self.host_bytes])
+                    pinner = threading.Thread(target=pin_loop, name=f"selas-pin-{self.label}", daemon=True)
+                    pinner.start()
+                k = 0
+                for name in todo:
+                    if self._stop:
+                        break
+                    spec = units[name]
+                    if self.tier[name] == VRAM:
+                        i, k = k % len(slots), k + 1
+                        if slot_done[i] is not None:
+                            slot_done[i].synchronize()  # the copy that last read this slot
+                        self.c.read_unit_into(spec, slots[i], direct=direct)
+                        with torch.cuda.stream(load_stream):
+                            self.views[name].buf.copy_(slots[i][: spec.nbytes], non_blocking=True)
+                            ev = torch.cuda.Event()
+                            ev.record(load_stream)
+                        slot_done[i] = self._copied[name] = ev
+                        self._ready[name].set()
+                    else:
+                        dst = self.host[name]
+                        prefaulter.wait(dst.data_ptr() - self.pool.base.data_ptr() + dst.numel())
+                        self.c.read_unit_into(spec, dst, direct=direct)
+                        with pin_cond:
+                            pin_q.append(name)
+                            pin_cond.notify()
+                if pinner is not None:
+                    with pin_cond:
+                        pin_q.append(None)
+                        pin_cond.notify()
+                    pinner.join()
+                    pinner = None
+                for ev in self._copied.values():
+                    ev.synchronize()
+            if not self._stop:
+                self._log_loaded(background=True)
+        except BaseException as e:  # surfaced to whoever waits for a unit
+            self._load_error = e
+        finally:
+            if pinner is not None:
+                with pin_cond:
+                    pin_q.append(None)
+                    pin_cond.notify()
+                pinner.join()
+            if prefaulter is not None:
+                prefaulter.close()
+            if scratch_pool is not None:
+                try:
+                    load_stream.synchronize()  # after an error too: no copy may still read the scratch
+                except Exception:  # pragma: no cover
+                    pass
+                scratch_pool.close()
+            for ev in self._ready.values():  # wake every waiter; they check _load_error
+                ev.set()
+
+    def _check_loading(self) -> None:
+        if self._load_error is not None:
+            raise RuntimeError(f"{self.label}: loading weights failed: {self._load_error!r}") from self._load_error
+
+    @property
+    def loading(self) -> bool:
+        return self._loader is not None and self._loader.is_alive()
+
+    def is_ready(self, name: str) -> bool:
+        ev = self._ready.get(name)
+        if ev is None:
+            return True
+        if not ev.is_set():
+            return False
+        self._check_loading()  # a failed loader sets every event: the unread units hold zeros
+        return True
+
+    def wait_unit(self, name: str) -> None:
+        """Block until ``name`` is loaded; for a VRAM unit, also order the current stream after its copy."""
+        ev = self._ready.get(name)
+        if ev is not None and not ev.is_set():
+            ev.wait()
+        self._check_loading()
+        done = self._copied.get(name)
+        if done is not None:
+            torch.cuda.current_stream(self.device).wait_event(done)
+
+    def wait_loaded(self) -> None:
+        if self._loader is not None:
+            self._loader.join()
+        self._check_loading()
 
     # ------------------------------------------------------------------ api
     def view(self, name: str) -> UnitView:
-        """A resident unit's view (raises for streamed units)."""
+        """A resident unit's view (raises for streamed units); waits until it is loaded."""
         try:
-            return self.views[name]
+            v = self.views[name]
         except KeyError:
             raise KeyError(f"{name} is not VRAM-resident (tier {self.tier.get(name)})") from None
+        self.wait_unit(name)
+        return v
 
     def stream(self, order: list[str], cyclic: bool) -> "UnitStream":
         return UnitStream(self, order, cyclic)
 
-    def close(self) -> None:
+    def close(self, release_host_async: bool = False) -> None:
+        """Free everything. ``release_host_async``: unmap the host pool on a background
+        thread (seconds for a large pool); VRAM and the pinning are released on return."""
+        self._stop = True
+        if self._loader is not None:
+            self._loader.join()  # finishes the read in flight, then stops
+            self._loader = None
         if self._active is not None:
             self._active.close()
         if self.device.type == "cuda":
@@ -330,7 +605,7 @@ class WeightStore:
         self.arena_buf = None
         self.arena = None
         if self.pool is not None:
-            self.pool.close()
+            self.pool.close(unmap_async=release_host_async)
             self.pool = None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
@@ -444,6 +719,9 @@ class UnitStream:
             raise RuntimeError(f"{store.label}: another stream is still open")
         self.store = store
         self.cyclic = cyclic
+        absent = [n for n in order if store.tier[n] == ABSENT]
+        if absent:
+            raise RuntimeError(f"{store.label}: cannot stream units that were not loaded: {', '.join(absent[:4])}")
         self.order = [n for n in order if store.tier[n] != VRAM]
         self.n = len(self.order)
         self.issue_seq = 0
@@ -474,6 +752,10 @@ class UnitStream:
             must = need and self.issue_seq == self.consume_seq
             tier = st.tier[name]
             if tier == HOST:
+                if not st.is_ready(name):  # still loading: issue it later, or wait if it is needed now
+                    if not must:
+                        return
+                    st.wait_unit(name)
                 src = st.host[name]
             else:
                 src = self.reader.peek(self.disk_seq, block=must)
@@ -505,7 +787,7 @@ class UnitStream:
     def acquire(self, name: str) -> UnitView:
         st = self.store
         if st.tier[name] == VRAM:
-            return st.views[name]
+            return st.view(name)
         if self.closed:
             raise RuntimeError("stream is closed")
         if not self.flights:

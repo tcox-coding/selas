@@ -11,6 +11,7 @@ Phases (each phase frees the GPU for the next):
 from __future__ import annotations
 
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,12 +21,14 @@ import torch
 from .container import Container
 from .codecs import decoded_is_view
 from .hw import cuda_device, default_compute_dtype, device_info, disk_bandwidth, load_profile, ram_budget, vram_budget
-from .models.flux import FluxConfig, FluxRunner, activation_reserve, main_order, mod_order, unit_flops
+from .models.flux import (FluxConfig, FluxRunner, Kernels, activation_reserve, compile_available, compile_count, main_order,
+                          mod_order, unit_flops, warm_kernels)
 from .models.vae import VaeConfig, VaeDecoder
 from .planner import Plan, UnitCost, make_plan
 from .sampling import get_noise, get_schedule, image_ids, latent_hw, pack, text_ids, unpack
 from .stepcache import StepCache, StepCacheConfig
-from .store import DISK, HOST, VRAM, WeightStore
+from .modcache import ModCache
+from .store import ABSENT, DISK, HOST, VRAM, WeightStore, wait_released
 from .text import TextEncoders
 from .util import GiB, MiB, align_up, fmt_seconds, human_bytes, log, read_json, warn, write_json_atomic
 
@@ -74,6 +77,8 @@ class RuntimeOptions:
     prompt_cache: bool = True
     placement: str = "auto"  # auto | vram | host | disk | first:N
     keep_loaded: bool = False
+    compile: bool = True  # fuse the elementwise code between matmuls with torch.compile (CUDA + Triton only)
+    fp16_accum: bool = False  # fp16 matmuls accumulate in fp16: faster on GeForce cards, approximate
 
 
 @dataclass
@@ -120,11 +125,23 @@ class FluxEngine:
         self._force_estimate = False  # set for one re-plan after an out-of-memory error
         self.residual_host = False  # tiered cache: block residuals in pinned RAM (set by make_plan)
         self._plan_key = None
+        self._plan_mods = True  # whether the loaded store has the modulation units
+        self._warm: threading.Thread | None = None  # kernels compiling for the loaded plan
+        self.mod_cache = ModCache(self.dir, self.tc.id, self.dtype, enabled=self.rt.prompt_cache)
+        self.kernels = Kernels(compiled=self.rt.compile and compile_available(self.device))
+        self.fp16_accum = self.rt.fp16_accum and self.dtype == torch.float16
+        if self.rt.fp16_accum and not self.fp16_accum:
+            warn(f"--fp16-accum applies to fp16 compute only; ignored for {self.dtype}")
+        if self.fp16_accum and not hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
+            warn(f"--fp16-accum needs PyTorch >= 2.7 (have {torch.__version__}); ignored")
+            self.fp16_accum = False
         dev = device_info(self.device)
         self._gpu_key = f"{dev.name}|{self.dtype}"
         log(f"{dev.name} (sm_{dev.capability[0]}{dev.capability[1]}), {human_bytes(dev.free)} free of {human_bytes(dev.total)}; "
             f"compute {str(self.dtype).removeprefix('torch.')}{' + fp32 residual stream' if self.dtype != torch.float32 else ''}"
-            f"{' (no native bf16 on this GPU)' if not dev.bf16_native and self.dtype == torch.float16 else ''}")
+            f"{' (no native bf16 on this GPU)' if not dev.bf16_native and self.dtype == torch.float16 else ''}"
+            f"; kernels {'fused (torch.compile)' if self.kernels.compiled else 'eager'}"
+            f"{', fp16 accumulation (approximate)' if self.fp16_accum else ''}")
         log(self.tc.describe())
 
     # ------------------------------------------------------------------ cost model
@@ -152,11 +169,16 @@ class FluxEngine:
         kind = spec.kind
         if kind in ("double", "single"):
             est = self._estimate(kind, l_img, l_txt, batch, spec)
-            scale = self._learned().get(kind, {}).get("scale")
+            scale = self._learned().get(self._calib_key(kind), {}).get("scale")
             return est * scale if scale else est
         # modulation units: one [S*B, D] x [D, kD] matmul per step count — negligible
         n = sum(1 for _ in spec.tensors)
         return 1e-4 * n
+
+    def _calib_key(self, kind: str) -> str:
+        """Profile key of a block kind's learned compute scale: one per numerics mode (fused is the default)."""
+        mode = ("fused" if self.kernels.compiled else "eager") + ("+acc16" if self.fp16_accum else "")
+        return kind if mode == "fused" else f"{kind}|{mode}"
 
     def _hoisted_bytes(self, steps: int, batch: int) -> int:
         """Modulation vectors for every step, computed in the prologue and kept in VRAM."""
@@ -223,7 +245,10 @@ class FluxEngine:
         return worst
 
     # ------------------------------------------------------------------ planning
-    def make_plan(self, width: int, height: int, batch: int, steps: int, cache: StepCacheConfig) -> Plan:
+    def make_plan(self, width: int, height: int, batch: int, steps: int, cache: StepCacheConfig,
+                  need_mods: bool = True) -> Plan:
+        """``need_mods=False``: every image's modulation vectors are cached, so the modulation
+        units (27 % of the weights) are left out: no RAM, no loading, no prologue streaming."""
         cfg, units = self.cfg, self.tc.units
         h, w = latent_hw(height, width)
         l_img = (h // 2) * (w // 2)
@@ -245,9 +270,10 @@ class FluxEngine:
 
         def plan_with(avail_bytes: int, ram_bytes: int = ram) -> Plan:
             if self.rt.placement != "auto":
-                return self._manual_plan(main, mods, avail_bytes, l_img, l_txt, batch, force)
+                return self._manual_plan(main, mods if need_mods else [], avail_bytes, l_img, l_txt, batch, force)
             cycle = [UnitCost(n, units[n].nbytes, self._unit_seconds(n, l_img, l_txt, micro) * (batch / micro), units[n].kind) for n in main]
-            once = [UnitCost(n, units[n].nbytes, self._unit_seconds(n, l_img, l_txt, batch), units[n].kind) for n in mods]
+            once = [UnitCost(n, units[n].nbytes, self._unit_seconds(n, l_img, l_txt, batch), units[n].kind)
+                    for n in (mods if need_mods else [])]
             return make_plan(cycle, once, avail_bytes, ram_bytes, self.hw.h2d_bw, self.hw.disk_bw, force_vram=force)
 
         def residuals(p: Plan) -> int:  # tiered: cached residual bytes for p's streamed blocks
@@ -259,6 +285,10 @@ class FluxEngine:
             plan, self.residual_host = self._plan_tiered(plan, plan_with, residuals, avail, ram)
         plan.tiers["globals"] = VRAM
         plan.sizes["globals"] = units["globals"].nbytes
+        if not need_mods:
+            for n in mods:
+                plan.tiers[n] = ABSENT
+            plan.notes.append("modulation units not loaded: every image's modulation vectors are cached")
         plan.notes.append(f"budget: {human_bytes(vram)} VRAM usable, reserve {human_bytes(act)} for activations "
                           f"({self.reserve_source}) + {human_bytes(reserve - act)} hoisted/cache, "
                           f"{human_bytes(ram)} pinned RAM; tokens {l_img}+{l_txt}, batch {batch} (micro {micro})")
@@ -322,52 +352,108 @@ class FluxEngine:
         return p
 
     # ------------------------------------------------------------------ loading
-    def ensure_loaded(self, width: int, height: int, batch: int, steps: int, cache: StepCacheConfig) -> None:
+    def ensure_loaded(self, width: int, height: int, batch: int, steps: int, cache: StepCacheConfig,
+                      need_mods: bool = True) -> None:
         key = (width, height, batch, steps, cache.policy, cache.predict, self.rt.micro_batch)
-        if self._plan_key == key and self.store is not None:
+        if self._plan_key == key and self.store is not None and (self._plan_mods or not need_mods):
             return
         self.unload()  # plan against the VRAM/RAM that will actually be free, not what the old store holds
-        plan = self.make_plan(width, height, batch, steps, cache)
+        wait_released()
+        plan = self.make_plan(width, height, batch, steps, cache, need_mods)
+        self._plan_mods = need_mods
         log("placement plan:\n  " + plan.describe(main_order(self.cfg)).replace("\n", "\n  "))
         self.plan = plan
+        # Kernels compile on one thread while another loads the weights in first-use order;
+        # neither is waited for here: denoising starts as soon as its first units are in.
+        self._warm = self._warm_kernels(width, height, batch) if self.kernels.compiled else None
+        order = ["globals"] + (mod_order(self.cfg) if need_mods else []) + main_order(self.cfg)
         self.store = WeightStore(self.tc, plan.tiers, self.device, self.dtype, arena_bytes=plan.arena_bytes,
-                                 staging_bytes=plan.staging_bytes, direct_io=self.rt.direct_io, label="flux")
-        self.runner = FluxRunner(self.store, self.cfg, self.dtype, micro_batch=self.rt.micro_batch)
+                                 staging_bytes=plan.staging_bytes, direct_io=self.rt.direct_io, label="flux", order=order)
+        self.runner = FluxRunner(self.store, self.cfg, self.dtype, micro_batch=self.rt.micro_batch, kernels=self.kernels)
         self._plan_key = key
 
-    def unload(self) -> None:
+    def _warm_kernels(self, width: int, height: int, batch: int) -> threading.Thread:
+        """Compile the fused kernels for this shape on a thread, while the weights load."""
+        h, w = latent_hw(height, width)
+        l_img = (h // 2) * (w // 2)
+        l_txt = int(self.defaults.get("max_t5_tokens", 512))
+        micro = min(self.rt.micro_batch or batch, batch)
+        shapes = {kind: {n: tuple(ts.shape) for n, ts in self.tc.units[unit].tensors.items()}
+                  for kind, unit in (("double", "double.0"), ("single", "single.0"), ("globals", "globals"))}
+
+        def run() -> None:
+            t0 = time.perf_counter()
+            try:
+                warm_kernels(self.kernels, self.cfg, shapes, l_img, l_txt, micro, self.dtype, self.device)
+                log(f"fused kernels compiled in {fmt_seconds(time.perf_counter() - t0)}")
+            except Exception as e:  # not fatal: they compile (or fall back to eager) on first use
+                warn(f"kernel warm-up failed ({type(e).__name__}: {str(e).splitlines()[0][:200]})")
+
+        t = threading.Thread(target=run, name="selas-compile", daemon=True)
+        t.start()
+        return t
+
+    def _join_warm(self) -> None:
+        if self._warm is not None:
+            self._warm.join()
+            self._warm = None
+
+    def unload(self, release_host_async: bool = False) -> None:
+        self._join_warm()
         if self.runner is not None:
             self.runner.end()
         if self.store is not None:
-            self.store.close()
+            self.store.close(release_host_async)
         self.store = None
         self.runner = None
         self._plan_key = None
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------ generation
-    def denoise(self, jobs: list[Job], embeds: dict, cache_cfg: StepCacheConfig, on_step=None) -> tuple[torch.Tensor, dict]:
-        """Run one batch (same size/steps/guidance). Returns (latents [B,16,h,w] CPU fp32, stats)."""
+    def _schedule(self, job: Job) -> tuple[int, float, list[float]]:
+        """(steps, guidance, sigmas) of a job."""
+        steps = job.steps or int(self.defaults.get("steps", 28))
+        guidance = job.guidance if job.guidance is not None else float(self.defaults.get("guidance", 3.5))
+        h, w = latent_hw(job.height, job.width)
+        return steps, guidance, get_schedule(steps, (h // 2) * (w // 2), shift=bool(self.defaults.get("shift", True)))
+
+    def _mod_key(self, job: Job, embeds: dict) -> str:
+        _, guidance, sigmas = self._schedule(job)
+        return self.mod_cache.key(embeds[job.prompt][1], guidance, sigmas)
+
+    def denoise(self, jobs: list[Job], embeds: dict, cache_cfg: StepCacheConfig, on_step=None,
+                need_mods: bool | None = None) -> tuple[torch.Tensor, dict]:
+        """Run one batch (same size/steps/guidance). Returns (latents [B,16,h,w] CPU fp32, stats).
+
+        ``need_mods``: load the modulation units even if this batch's vectors are all cached
+        (``generate`` sets it when a later batch will need them, so the store loads once)."""
         j0 = jobs[0]
         width, height = j0.width, j0.height
-        steps = j0.steps or int(self.defaults.get("steps", 28))
-        guidance = j0.guidance if j0.guidance is not None else float(self.defaults.get("guidance", 3.5))
+        steps, guidance, sigmas = self._schedule(j0)
         b = len(jobs)
-        self.ensure_loaded(width, height, b, steps, cache_cfg)
+        keys = [self._mod_key(j, embeds) for j in jobs]
+        cached = {k: self.mod_cache.load(k) for k in dict.fromkeys(keys)}  # CPU {unit: [S, kD]} or None
+        todo = [k for k, v in cached.items() if v is None]
+        self.ensure_loaded(width, height, b, steps, cache_cfg, need_mods=bool(todo or need_mods))
         runner, store = self.runner, self.store
         h, w = latent_hw(height, width)
         l_img = (h // 2) * (w // 2)
-        sigmas = get_schedule(steps, l_img, shift=bool(self.defaults.get("shift", True)))
         txt = torch.stack([embeds[j.prompt][0] for j in jobs])
         pooled = torch.stack([embeds[j.prompt][1] for j in jobs])
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()  # so the reserved-memory peak below measures what this run really needs
-        base_reserved = torch.cuda.memory_reserved(self.device)
-        torch.cuda.reset_peak_memory_stats(self.device)
 
+        # The prologue runs while the weights are still loading (its units come first).
         t0 = time.perf_counter()
+        overlapped = store.loading
         store.stats.reset()
-        cond = runner.prepare(sigmas, guidance, pooled, txt, image_ids(height, width), text_ids(txt.shape[1]))
+        mods = {k: (None if v is None else {n: t.to(self.device).unsqueeze(1) for n, t in v.items()}) for k, v in cached.items()}
+        if todo:  # one pass over the modulation units for every image not in the cache
+            first = {k: embeds[j.prompt][1] for k, j in reversed(list(zip(keys, jobs)))}
+            for k, m in zip(todo, runner.modulations([runner.svec(sigmas, guidance, first[k][None]) for k in todo])):
+                mods[k] = m
+                self.mod_cache.save(k, m)
+        cond = runner.prepare(sigmas, guidance, pooled, txt, image_ids(height, width), text_ids(txt.shape[1]),
+                              mods={n: torch.cat([mods[k][n] for k in keys], dim=1) for n in runner.main})
+        del mods, cached  # the per-image copies: cond holds the batch
         torch.cuda.synchronize(self.device)
         t_prologue = time.perf_counter() - t0
         prologue_bytes = dict(store.stats.h2d_bytes)
@@ -376,10 +462,22 @@ class FluxEngine:
         streamed = {n for n in runner.main if runner.is_streamed(n)}
         cache = StepCache(cache_cfg, steps, streamed, torch.float32 if self.dtype == torch.float32 else torch.bfloat16,
                           host_residuals=self.residual_host)
+        self._join_warm()  # the kernels must be ready: compiling mid-step would stall it
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()  # so the reserved-memory peak below measures what the steps really need
+        # Learned activation = the steps' peak beyond weights, arena, hoisted vectors and cache
+        # buffers; it includes the latent/text state, which is allocated already.
+        base_reserved = torch.cuda.memory_reserved(self.device)
+        state = sum(t.nbytes for t in (x, cond.txt, cond.cos, cond.sin))
+        torch.cuda.reset_peak_memory_stats(self.device)
+        compiles = compile_count()  # compiling mid-run allocates scratch memory and takes time: learn nothing then
         step_times, decisions = [], []
         learn_step = 1 if steps > 2 else None
         store.stats.reset()
         compute = torch.cuda.current_stream(self.device)
+        accum = torch.backends.cuda.matmul.allow_fp16_accumulation if self.fp16_accum else None
+        if self.fp16_accum:  # the main loop only: the prologue's modulation vectors stay exact
+            torch.backends.cuda.matmul.allow_fp16_accumulation = True
         runner.begin()
         try:
             for s in range(steps):
@@ -397,7 +495,7 @@ class FluxEngine:
                 dt_s = time.perf_counter() - ts
                 step_times.append(dt_s)
                 decisions.append(info.decision)
-                if s == learn_step:
+                if s == learn_step and compile_count() == compiles:
                     self._learn(store.stats.compute_seconds(), l_img, txt.shape[1], b)
                 if on_step:
                     on_step(s, steps, dt_s, info)
@@ -405,14 +503,17 @@ class FluxEngine:
                     extra = "" if info.decision == "full" else f" [{info.decision} d={info.distance:.3f}]"
                     log(f"step {s + 1:2d}/{steps} {fmt_seconds(dt_s)}{extra}", 1)
         finally:
+            if accum is not None:
+                torch.backends.cuda.matmul.allow_fp16_accumulation = accum
             store.profile = self.rt.profile
             runner.end()
             summary = cache.summary()
             cache.close()
         stall = store.stats.stall_seconds() if self.rt.profile else None
-        if cache_cfg.policy != "tiered" or self.residual_host:  # VRAM-kept tiered residuals would skew it
-            act = (torch.cuda.max_memory_reserved(self.device) - base_reserved
-                   - self._hoisted_bytes(steps, b) - self._cache_bytes(cache_cfg, b, l_img))
+        if compile_count() != compiles:
+            log("kernels compiled during this run: activation memory not recorded", 1)
+        elif cache_cfg.policy != "tiered" or self.residual_host:  # VRAM-kept tiered residuals would skew it
+            act = torch.cuda.max_memory_reserved(self.device) - base_reserved + state - self._cache_bytes(cache_cfg, b, l_img)
             micro = min(self.rt.micro_batch or b, b)
             self._learn_activation({"l_img": l_img, "l_txt": txt.shape[1], "batch": b, "micro": micro}, max(0, act))
         lat = unpack(x, height, width).float().cpu()
@@ -420,7 +521,10 @@ class FluxEngine:
         stats = {
             "steps": steps,
             "prologue_s": t_prologue,
+            "prologue_while_loading": overlapped,
             "prologue_h2d": prologue_bytes,
+            "mods_cached": len(set(keys)) - len(todo),
+            "mods_computed": len(todo),
             "step_s": step_times,
             "mean_full_step_s": sum(full[1:] or full) / max(1, len(full[1:] or full)),
             "predicted_step_s": self.plan.step_s,
@@ -448,7 +552,8 @@ class FluxEngine:
             micro = min(self.rt.micro_batch or batch, batch)
             est = self._estimate(kind, l_img, l_txt, micro, self.tc.units[name]) * (batch / micro)
             if est > 0:
-                entry[kind] = {"scale": (secs / n) / est, "seconds": secs / n, "tokens": l_img + l_txt, "batch": batch}
+                entry[self._calib_key(kind)] = {"scale": (secs / n) / est, "seconds": secs / n, "tokens": l_img + l_txt,
+                                                "batch": batch}
         db[self._gpu_key] = entry
         try:
             write_json_atomic(path, db)
@@ -502,27 +607,30 @@ class FluxEngine:
         groups: dict[tuple, list[Job]] = {}
         for j in jobs:
             groups.setdefault((j.width, j.height, j.steps, j.guidance), []).append(j)
+        # Load the modulation units only if some image's vectors are not cached; decided once for
+        # the whole call (per size), so later batches of the same size reuse the store.
+        need_mods = {g: any(not self.mod_cache.has(self._mod_key(j, embeds)) for j in gjobs) for g, gjobs in groups.items()}
         pending: list[tuple[Job, torch.Tensor, dict]] = []
-        for gjobs in groups.values():
+        for g, gjobs in groups.items():
             for i in range(0, len(gjobs), batch_size):
                 batch = gjobs[i : i + batch_size]
-                lat, stats = self._denoise_safe(batch, embeds, cache_cfg, on_step)
+                lat, stats = self._denoise_safe(batch, embeds, cache_cfg, on_step, need_mods[g])
                 self._report(stats)
                 for k, j in enumerate(batch):
                     pending.append((j, lat[k : k + 1], stats))
         if not self.rt.keep_loaded:
-            self.unload()
+            self.unload(release_host_async=True)  # unpinning overlaps the VAE decode
         t0 = time.perf_counter()
         images = self.decode([p[1] for p in pending], [(p[0].width, p[0].height) for p in pending])
         t_vae = time.perf_counter() - t0
         log(f"text {fmt_seconds(t_text)}, VAE {fmt_seconds(t_vae)}, total {fmt_seconds(time.perf_counter() - t_all)}")
         return [Result(j, im, {**st, "text_s": t_text, "vae_s": t_vae}) for (j, _, st), im in zip(pending, images)]
 
-    def _denoise_safe(self, jobs, embeds, cache_cfg, on_step=None):
+    def _denoise_safe(self, jobs, embeds, cache_cfg, on_step=None, need_mods=None):
         """``denoise``; if a *learned* activation reserve runs out of VRAM, widen its margin
         and retry once with the conservative estimate instead of failing the batch."""
         try:
-            return self.denoise(jobs, embeds, cache_cfg, on_step)
+            return self.denoise(jobs, embeds, cache_cfg, on_step, need_mods)
         except torch.cuda.OutOfMemoryError:
             if self.reserve_source != "learned":
                 raise
@@ -532,7 +640,7 @@ class FluxEngine:
         self.unload()
         self._force_estimate = True
         try:
-            return self.denoise(jobs, embeds, cache_cfg, on_step)
+            return self.denoise(jobs, embeds, cache_cfg, on_step, need_mods)
         finally:
             self._force_estimate = False
             self._plan_key = None  # the next batch plans with the (re-)learned reserve again
@@ -540,7 +648,10 @@ class FluxEngine:
     def _report(self, st: dict) -> None:
         h2d = st["h2d_bytes"]
         n = max(1, st["steps"])
-        msg = (f"denoise: prologue {fmt_seconds(st['prologue_s'])}, mean full step {fmt_seconds(st['mean_full_step_s'])} "
+        notes = [f"modulations {st['mods_cached']} cached, {st['mods_computed']} computed"] if "mods_cached" in st else []
+        if st.get("prologue_while_loading"):
+            notes.insert(0, "while loading")
+        msg = (f"denoise: prologue {fmt_seconds(st['prologue_s'])} ({', '.join(notes)}), mean full step {fmt_seconds(st['mean_full_step_s'])} "
                f"(planner predicted {fmt_seconds(st['predicted_step_s'])}), streamed/step host {human_bytes(h2d[HOST] / n)} "
                f"disk {human_bytes(h2d[DISK] / n)}, peak VRAM {human_bytes(st['peak_vram'])}")
         if st.get("stall_s") is not None:
